@@ -29,6 +29,8 @@ local GetTime = GetTime
 local GetContainerNumSlots = GetContainerNumSlots
 local GetContainerItemLink = GetContainerItemLink
 local GetContainerItemInfo = GetContainerItemInfo
+local UnitName = UnitName
+local UnitExists = UnitExists
 local UIParent = UIParent
 local DEFAULT_CHAT_FRAME = DEFAULT_CHAT_FRAME
 local WorldFrame = WorldFrame
@@ -75,6 +77,8 @@ LootMonitor.mobLootData = {}
 LootMonitor.pendingMobKills = {}
 LootMonitor.currentLootMob = nil
 LootMonitor.currentLootTime = 0
+LootMonitor.lastKnownMob = nil
+LootMonitor.lastKnownMobTime = 0
 
 local LOOT_SESSION_TIMEOUT = 2.5
 local MOB_KILL_TIMEOUT = 30
@@ -430,6 +434,7 @@ function LootMonitor:RegisterEvents()
     frame:RegisterEvent("CHAT_MSG_MONEY")
     frame:RegisterEvent("CHAT_MSG_SYSTEM")
     frame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
+    frame:RegisterEvent("CHAT_MSG_COMBAT_XP_GAIN")
     frame:RegisterEvent("ADDON_LOADED")
     frame:RegisterEvent("PLAYER_LOGOUT")
     frame:SetScript("OnEvent", function()
@@ -446,6 +451,8 @@ function LootMonitor:RegisterEvents()
             LootMonitor:ProcessSystemMessage(arg1)
         elseif event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" then
             LootMonitor:ProcessMobDeathMessage(arg1)
+        elseif event == "CHAT_MSG_COMBAT_XP_GAIN" then
+            LootMonitor:ProcessMobDeathMessage(arg1)
         elseif event == "PLAYER_LOGOUT" then
             -- Save position before logout
             LootMonitor:SavePosition()
@@ -458,10 +465,16 @@ function LootMonitor:ProcessMobDeathMessage(message)
     if not message or not LootMonitorDB.mobTrackerEnabled then return end
 
     local mobName = strgsub(message, " dies%.$", "")
+    if mobName == message then
+        -- XP gain format can be "Boar dies, you gain 55 experience."
+        mobName = strgsub(message, " dies, .+$", "")
+    end
     if not mobName or mobName == "" or mobName == message then
         return
     end
 
+    self.lastKnownMob = mobName
+    self.lastKnownMobTime = gettime()
     tinsert(self.pendingMobKills, { name = mobName, time = gettime() })
 end
 
@@ -490,6 +503,25 @@ function LootMonitor:ResolveLootMob()
     self:CleanupPendingMobKills()
 
     if tgetn(self.pendingMobKills) == 0 then
+        -- Fallback if this client does not fire death events reliably
+        if self.lastKnownMob and (now - self.lastKnownMobTime) <= MOB_KILL_TIMEOUT then
+            self.currentLootMob = self.lastKnownMob
+            self.currentLootTime = now
+            return self.lastKnownMob, true
+        end
+
+        -- Final fallback to current target when available (corpse still targeted)
+        if UnitExists("target") then
+            local targetName = UnitName("target")
+            if targetName and targetName ~= "" then
+                self.currentLootMob = targetName
+                self.currentLootTime = now
+                self.lastKnownMob = targetName
+                self.lastKnownMobTime = now
+                return targetName, true
+            end
+        end
+
         return nil, false
     end
 
