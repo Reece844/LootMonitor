@@ -31,6 +31,7 @@ local GetContainerItemLink = GetContainerItemLink
 local GetContainerItemInfo = GetContainerItemInfo
 local UnitName = UnitName
 local UnitExists = UnitExists
+local CanLootUnit = CanLootUnit
 local UIParent = UIParent
 local DEFAULT_CHAT_FRAME = DEFAULT_CHAT_FRAME
 local WorldFrame = WorldFrame
@@ -435,6 +436,8 @@ function LootMonitor:RegisterEvents()
     frame:RegisterEvent("CHAT_MSG_SYSTEM")
     frame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
     frame:RegisterEvent("CHAT_MSG_COMBAT_XP_GAIN")
+    frame:RegisterEvent("LOOT_OPENED")
+    frame:RegisterEvent("LOOT_CLOSED")
     frame:RegisterEvent("ADDON_LOADED")
     frame:RegisterEvent("PLAYER_LOGOUT")
     frame:SetScript("OnEvent", function()
@@ -453,12 +456,78 @@ function LootMonitor:RegisterEvents()
             LootMonitor:ProcessMobDeathMessage(arg1)
         elseif event == "CHAT_MSG_COMBAT_XP_GAIN" then
             LootMonitor:ProcessMobDeathMessage(arg1)
+        elseif event == "LOOT_OPENED" then
+            LootMonitor:ProcessLootOpened()
+        elseif event == "LOOT_CLOSED" then
+            LootMonitor:ProcessLootClosed()
         elseif event == "PLAYER_LOGOUT" then
             -- Save position before logout
             LootMonitor:SavePosition()
             LootMonitor:SaveMobTrackerWindow()
         end
     end)
+end
+
+function LootMonitor:DetermineLootSourceName()
+    if UnitExists("target") then
+        if not CanLootUnit or CanLootUnit("target") then
+            local targetName = UnitName("target")
+            if targetName and targetName ~= "" then
+                return targetName
+            end
+        end
+    end
+
+    if UnitExists("mouseover") then
+        local mouseoverName = UnitName("mouseover")
+        if mouseoverName and mouseoverName ~= "" then
+            return mouseoverName
+        end
+    end
+
+    return nil
+end
+
+function LootMonitor:RegisterMobKill(mobName)
+    if not LootMonitorDB.mobTrackerEnabled then return end
+    if not mobName or mobName == "" then return end
+
+    local entry = self.mobLootData[mobName]
+    if not entry then
+        entry = {
+            kills = 0,
+            items = {},
+            lastUpdate = gettime()
+        }
+        self.mobLootData[mobName] = entry
+    end
+
+    entry.kills = entry.kills + 1
+    entry.lastUpdate = gettime()
+end
+
+function LootMonitor:ProcessLootOpened()
+    if not LootMonitorDB.mobTrackerEnabled then return end
+
+    local mobName = self:DetermineLootSourceName()
+    if not mobName then
+        return
+    end
+
+    self.currentLootMob = mobName
+    self.currentLootTime = gettime()
+    self.lastKnownMob = mobName
+    self.lastKnownMobTime = gettime()
+    self.pendingMobKills = {}
+
+    -- Count the kill as soon as loot opens so items attach reliably.
+    self:RegisterMobKill(mobName)
+    self:RefreshMobTrackerWindow()
+end
+
+function LootMonitor:ProcessLootClosed()
+    self.currentLootMob = nil
+    self.currentLootTime = 0
 end
 
 function LootMonitor:ProcessMobDeathMessage(message)
