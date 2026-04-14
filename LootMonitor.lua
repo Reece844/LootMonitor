@@ -73,17 +73,18 @@ LootMonitor.frame = nil
 LootMonitor.moveFrame = nil
 LootMonitor.moveMode = false
 LootMonitor.mobTrackerFrame = nil
-LootMonitor.mobTrackerLines = {}
+LootMonitor.mobTrackerCards = {}
 LootMonitor.mobLootData = {}
 LootMonitor.pendingMobKills = {}
 LootMonitor.currentLootMob = nil
 LootMonitor.currentLootTime = 0
 LootMonitor.lastKnownMob = nil
 LootMonitor.lastKnownMobTime = 0
+LootMonitor.recentKillTimestamps = {}
 
 local LOOT_SESSION_TIMEOUT = 2.5
 local MOB_KILL_TIMEOUT = 30
-
+local KILL_DEDUPE_WINDOW = 1.5
 
 
 -- Custom print function for WoW 1.12.1 compatibility
@@ -98,6 +99,74 @@ end
 -- Create a hidden tooltip frame for scanning item tooltips
 local LootMonitorTooltip = CreateFrame("GameTooltip", "LootMonitorTooltip", nil, "GameTooltipTemplate")
 LootMonitorTooltip:SetOwner(WorldFrame, "ANCHOR_NONE")
+
+-- Local tooltip for vendor value lookup (Aux-compatible fallback)
+local LootMonitorValueTooltip = CreateFrame("GameTooltip", "LootMonitorValueTooltip", nil, "GameTooltipTemplate")
+LootMonitorValueTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+LootMonitorValueTooltip:SetScript("OnTooltipAddMoney", function()
+    this.money = arg1
+end)
+
+function LootMonitor:GetCoinValueCopper(itemName)
+    if not itemName then return 0 end
+
+    local lowerName = strlower(itemName)
+    local copper = tonumber(strgsub(lowerName, "^(%d+)%s*copper$", "%1"))
+    if copper and copper > 0 then return copper end
+
+    local silver = tonumber(strgsub(lowerName, "^(%d+)%s*silver$", "%1"))
+    if silver and silver > 0 then return silver * 100 end
+
+    local gold = tonumber(strgsub(lowerName, "^(%d+)%s*gold$", "%1"))
+    if gold and gold > 0 then return gold * 10000 end
+
+    return 0
+end
+
+function LootMonitor:GetItemLinkForValue(itemName, itemData, isNameOnly)
+    if not isNameOnly and itemData and strfind(itemData, "|Hitem:") then
+        return itemData
+    end
+
+    local _, bag, slot = self:FindItemInBags(itemName)
+    if bag and slot then
+        return GetContainerItemLink(bag, slot)
+    end
+
+    return nil
+end
+
+function LootMonitor:GetItemValueCopper(itemName, itemData, isNameOnly)
+    local coinValue = self:GetCoinValueCopper(itemName)
+    if coinValue > 0 then
+        return coinValue
+    end
+
+    local link = self:GetItemLinkForValue(itemName, itemData, isNameOnly)
+    if not link then
+        return 0
+    end
+
+    -- Prefer Aux tooltip money if Aux addon tooltip exists.
+    if AuxTooltip then
+        AuxTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+        AuxTooltip.money = 0
+        AuxTooltip:SetHyperlink(link)
+        if AuxTooltip.money and AuxTooltip.money > 0 then
+            return AuxTooltip.money
+        end
+    end
+
+    -- Fallback to internal tooltip money scan.
+    LootMonitorValueTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+    LootMonitorValueTooltip.money = 0
+    LootMonitorValueTooltip:SetHyperlink(link)
+    if LootMonitorValueTooltip.money and LootMonitorValueTooltip.money > 0 then
+        return LootMonitorValueTooltip.money
+    end
+
+    return 0
+end
 
 -- Check if an item is a quest item by scanning its tooltip
 function LootMonitor:IsQuestItem(itemName)
@@ -488,22 +557,29 @@ function LootMonitor:DetermineLootSourceName()
     return nil
 end
 
-function LootMonitor:RegisterMobKill(mobName)
+function LootMonitor:RegisterMobKill(mobName, killTime)
     if not LootMonitorDB.mobTrackerEnabled then return end
     if not mobName or mobName == "" then return end
+    local now = killTime or gettime()
+
+    local lastKillAt = self.recentKillTimestamps[mobName]
+    if lastKillAt and (now - lastKillAt) <= KILL_DEDUPE_WINDOW then
+        return
+    end
+    self.recentKillTimestamps[mobName] = now
 
     local entry = self.mobLootData[mobName]
     if not entry then
         entry = {
             kills = 0,
             items = {},
-            lastUpdate = gettime()
+            lastUpdate = now
         }
         self.mobLootData[mobName] = entry
     end
 
     entry.kills = entry.kills + 1
-    entry.lastUpdate = gettime()
+    entry.lastUpdate = now
 end
 
 function LootMonitor:ProcessLootOpened()
@@ -520,9 +596,6 @@ function LootMonitor:ProcessLootOpened()
     self.lastKnownMobTime = gettime()
     self.pendingMobKills = {}
 
-    -- Count the kill as soon as loot opens so items attach reliably.
-    self:RegisterMobKill(mobName)
-    self:RefreshMobTrackerWindow()
 end
 
 function LootMonitor:ProcessLootClosed()
@@ -542,9 +615,12 @@ function LootMonitor:ProcessMobDeathMessage(message)
         return
     end
 
+    local now = gettime()
     self.lastKnownMob = mobName
-    self.lastKnownMobTime = gettime()
-    tinsert(self.pendingMobKills, { name = mobName, time = gettime() })
+    self.lastKnownMobTime = now
+    tinsert(self.pendingMobKills, { name = mobName, time = now })
+    self:RegisterMobKill(mobName, now)
+    self:RefreshMobTrackerWindow()
 end
 
 function LootMonitor:CleanupPendingMobKills()
@@ -611,11 +687,11 @@ function LootMonitor:PruneOldMobEntries()
     end
 end
 
-function LootMonitor:RegisterMobLoot(itemName, quantity)
+function LootMonitor:RegisterMobLoot(itemName, quantity, itemData, isNameOnly)
     if not LootMonitorDB.mobTrackerEnabled then return end
     if not itemName then return end
 
-    local mobName, isNewKill = self:ResolveLootMob()
+    local mobName = self:ResolveLootMob()
     if not mobName then return end
 
     local entry = self.mobLootData[mobName]
@@ -628,16 +704,26 @@ function LootMonitor:RegisterMobLoot(itemName, quantity)
         self.mobLootData[mobName] = entry
     end
 
-    if isNewKill then
-        entry.kills = entry.kills + 1
-    end
-
     local itemQty = quantity or 1
     if itemQty < 1 then itemQty = 1 end
     if not entry.items[itemName] then
-        entry.items[itemName] = 0
+        entry.items[itemName] = {
+            count = 0,
+            texture = nil,
+            unitValue = 0
+        }
     end
-    entry.items[itemName] = entry.items[itemName] + itemQty
+    entry.items[itemName].count = entry.items[itemName].count + itemQty
+    if not entry.items[itemName].texture then
+        local texture = self:FindItemTextureInBags(itemName)
+        if not texture then
+            texture = self:GetFallbackIcon(itemName)
+        end
+        entry.items[itemName].texture = texture
+    end
+    if entry.items[itemName].unitValue == 0 then
+        entry.items[itemName].unitValue = self:GetItemValueCopper(itemName, itemData, isNameOnly)
+    end
     entry.lastUpdate = gettime()
 
     self:PruneOldMobEntries()
@@ -661,8 +747,16 @@ end
 
 function LootMonitor:GetSortedItemEntries(itemTable)
     local itemList = {}
-    for itemName, qty in pairs(itemTable) do
-        tinsert(itemList, { name = itemName, qty = qty })
+    for itemName, itemData in pairs(itemTable) do
+        local count = itemData.count or 0
+        if count > 0 then
+            tinsert(itemList, {
+                name = itemName,
+                qty = count,
+                texture = itemData.texture,
+                unitValue = itemData.unitValue or 0
+            })
+        end
     end
 
     tsort(itemList, function(a, b)
@@ -675,14 +769,63 @@ function LootMonitor:GetSortedItemEntries(itemTable)
     return itemList
 end
 
-function LootMonitor:AcquireMobLine(index)
-    if not self.mobTrackerLines[index] then
-        local line = self.mobTrackerFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        line:SetJustifyH("LEFT")
-        line:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 12, -28)
-        self.mobTrackerLines[index] = line
+function LootMonitor:GetMobTotalValueCopper(mobEntry)
+    local total = 0
+    for _, itemData in pairs(mobEntry.items) do
+        local count = itemData.count or 0
+        local unitValue = itemData.unitValue or 0
+        total = total + (count * unitValue)
     end
-    return self.mobTrackerLines[index]
+    return total
+end
+
+function LootMonitor:BuildMobLootIconString(sortedItems)
+    local iconParts = {}
+    local itemCount = tgetn(sortedItems)
+    for i = 1, itemCount do
+        local item = sortedItems[i]
+        local texture = item.texture or TEXTURE_PATH_QUESTION
+        -- WoW inline texture markup: icon + quantity text.
+        tinsert(iconParts, strformat("|T%s:14:14:0:0|t x%d", texture, item.qty))
+    end
+
+    return table.concat(iconParts, "    ")
+end
+
+function LootMonitor:AcquireMobCard(index)
+    if not self.mobTrackerCards[index] then
+        local card = CreateFrame("Frame", nil, self.mobTrackerFrame)
+        card:SetWidth(self.mobTrackerFrame:GetWidth() - 18)
+        card:SetHeight(42)
+
+        local topLine = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        topLine:SetJustifyH("LEFT")
+        topLine:SetPoint("TOPLEFT", card, "TOPLEFT", 0, 0)
+        topLine:SetPoint("TOPRIGHT", card, "TOPRIGHT", 0, 0)
+        topLine:SetTextColor(1, 0.85, 0.3)
+
+        local lootLine = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        lootLine:SetJustifyH("LEFT")
+        lootLine:SetPoint("TOPLEFT", topLine, "BOTTOMLEFT", 0, -4)
+        lootLine:SetPoint("TOPRIGHT", card, "TOPRIGHT", 0, -4)
+        lootLine:SetTextColor(0.92, 0.92, 0.92)
+
+        card.topLine = topLine
+        card.lootLine = lootLine
+        self.mobTrackerCards[index] = card
+    end
+
+    local card = self.mobTrackerCards[index]
+    card:SetWidth(self.mobTrackerFrame:GetWidth() - 22)
+    return card
+end
+
+function LootMonitor:HideUnusedMobCards(startIndex)
+    local i = startIndex
+    while self.mobTrackerCards[i] do
+        self.mobTrackerCards[i]:Hide()
+        i = i + 1
+    end
 end
 
 function LootMonitor:RefreshMobTrackerWindow()
@@ -697,7 +840,7 @@ function LootMonitor:RefreshMobTrackerWindow()
 
     local maxEntries = LootMonitorDB.mobTrackerMaxMobs or 6
     local sortedMobs = self:GetSortedMobEntries()
-    local lineIndex = 1
+    local cardIndex = 1
     local yOffset = -30
     local maxHeight = self.mobTrackerFrame:GetHeight() - 16
 
@@ -708,41 +851,29 @@ function LootMonitor:RefreshMobTrackerWindow()
         end
 
         local mob = sortedMobs[i]
-        local header = self:AcquireMobLine(lineIndex)
-        header:ClearAllPoints()
-        header:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 12, yOffset)
-        header:SetText(mob.name .. " - " .. mob.data.kills .. " kill(s)")
-        header:SetTextColor(1, 0.85, 0.3)
-        header:Show()
-        lineIndex = lineIndex + 1
-        yOffset = yOffset - 16
-
         local sortedItems = self:GetSortedItemEntries(mob.data.items)
-        local itemCount = tgetn(sortedItems)
-        for j = 1, itemCount do
-            if -yOffset > maxHeight then
-                break
-            end
+        local totalValueCopper = self:GetMobTotalValueCopper(mob.data)
+        local headerText = strformat("%s x%d      ----      %dc", mob.name, mob.data.kills, totalValueCopper)
+        local lootText = self:BuildMobLootIconString(sortedItems)
 
-            local item = sortedItems[j]
-            local itemLine = self:AcquireMobLine(lineIndex)
-            itemLine:ClearAllPoints()
-            itemLine:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 24, yOffset)
-            itemLine:SetText(item.name .. " " .. item.qty .. "x")
-            itemLine:SetTextColor(0.92, 0.92, 0.92)
-            itemLine:Show()
-            lineIndex = lineIndex + 1
-            yOffset = yOffset - 14
-        end
+        local card = self:AcquireMobCard(cardIndex)
+        card:ClearAllPoints()
+        card:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 12, yOffset)
+        card.topLine:SetText(headerText)
+        card.lootLine:SetText(lootText)
 
-        yOffset = yOffset - 4
+        local topHeight = card.topLine:GetStringHeight()
+        local lootHeight = card.lootLine:GetStringHeight()
+        local cardHeight = topHeight + lootHeight + 8
+        if cardHeight < 32 then cardHeight = 32 end
+        card:SetHeight(cardHeight)
+        card:Show()
+
+        yOffset = yOffset - cardHeight - 8
+        cardIndex = cardIndex + 1
     end
 
-    local i = lineIndex
-    while self.mobTrackerLines[i] do
-        self.mobTrackerLines[i]:Hide()
-        i = i + 1
-    end
+    self:HideUnusedMobCards(cardIndex)
 end
 
 -- Extract quantity from loot message (looks for x2, x3, etc.)
@@ -997,7 +1128,7 @@ function LootMonitor:AddLootItem(itemData, isNameOnly, quantity)
         self:CreateLootNotification(itemName, actualQuantity, itemData, isNameOnly)
     end
 
-    self:RegisterMobLoot(itemName, actualQuantity)
+    self:RegisterMobLoot(itemName, actualQuantity, itemData, isNameOnly)
 end
 
 -- Find item texture and bag position in player's bags (optimized)
