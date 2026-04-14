@@ -7,6 +7,7 @@ local strlower = string.lower
 local strsub = string.sub
 local strformat = string.format
 local strgsub = string.gsub
+local strmatch = string.match
 local strlen = string.len
 local tinsert = table.insert
 local tremove = table.remove
@@ -14,6 +15,7 @@ local tgetn = table.getn
 local tsort = table.sort
 local mathsin = math.sin
 local mathpi = math.pi
+local mathfloor = math.floor
 local mathmod = mod  -- Lua 5.0 uses global mod, not math.mod
 local gettime = GetTime
 local tonumber = tonumber
@@ -111,13 +113,13 @@ function LootMonitor:GetCoinValueCopper(itemName)
     if not itemName then return 0 end
 
     local lowerName = strlower(itemName)
-    local copper = tonumber(strgsub(lowerName, "^(%d+)%s*copper$", "%1"))
+    local copper = tonumber(strmatch(lowerName, "^(%d+)%s*copper$"))
     if copper and copper > 0 then return copper end
 
-    local silver = tonumber(strgsub(lowerName, "^(%d+)%s*silver$", "%1"))
+    local silver = tonumber(strmatch(lowerName, "^(%d+)%s*silver$"))
     if silver and silver > 0 then return silver * 100 end
 
-    local gold = tonumber(strgsub(lowerName, "^(%d+)%s*gold$", "%1"))
+    local gold = tonumber(strmatch(lowerName, "^(%d+)%s*gold$"))
     if gold and gold > 0 then return gold * 10000 end
 
     return 0
@@ -620,7 +622,6 @@ function LootMonitor:ProcessMobDeathMessage(message)
     self.lastKnownMobTime = now
     tinsert(self.pendingMobKills, { name = mobName, time = now })
     self:RegisterMobKill(mobName, now)
-    self:RefreshMobTrackerWindow()
 end
 
 function LootMonitor:CleanupPendingMobKills()
@@ -769,6 +770,15 @@ function LootMonitor:GetSortedItemEntries(itemTable)
     return itemList
 end
 
+function LootMonitor:MobEntryHasLoot(mobEntry)
+    for _, itemData in pairs(mobEntry.items) do
+        if (itemData.count or 0) > 0 then
+            return true
+        end
+    end
+    return false
+end
+
 function LootMonitor:GetMobTotalValueCopper(mobEntry)
     local total = 0
     for _, itemData in pairs(mobEntry.items) do
@@ -777,19 +787,6 @@ function LootMonitor:GetMobTotalValueCopper(mobEntry)
         total = total + (count * unitValue)
     end
     return total
-end
-
-function LootMonitor:BuildMobLootIconString(sortedItems)
-    local iconParts = {}
-    local itemCount = tgetn(sortedItems)
-    for i = 1, itemCount do
-        local item = sortedItems[i]
-        local texture = item.texture or TEXTURE_PATH_QUESTION
-        -- WoW inline texture markup: icon + quantity text.
-        tinsert(iconParts, strformat("|T%s:14:14:0:0|t x%d", texture, item.qty))
-    end
-
-    return table.concat(iconParts, "    ")
 end
 
 function LootMonitor:AcquireMobCard(index)
@@ -804,20 +801,77 @@ function LootMonitor:AcquireMobCard(index)
         topLine:SetPoint("TOPRIGHT", card, "TOPRIGHT", 0, 0)
         topLine:SetTextColor(1, 0.85, 0.3)
 
-        local lootLine = card:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        lootLine:SetJustifyH("LEFT")
-        lootLine:SetPoint("TOPLEFT", topLine, "BOTTOMLEFT", 0, -4)
-        lootLine:SetPoint("TOPRIGHT", card, "TOPRIGHT", 0, -4)
-        lootLine:SetTextColor(0.92, 0.92, 0.92)
+        local iconContainer = CreateFrame("Frame", nil, card)
+        iconContainer:SetPoint("TOPLEFT", topLine, "BOTTOMLEFT", 0, -4)
+        iconContainer:SetPoint("TOPRIGHT", card, "TOPRIGHT", 0, -4)
+        iconContainer:SetHeight(16)
 
         card.topLine = topLine
-        card.lootLine = lootLine
+        card.iconContainer = iconContainer
+        card.iconSlots = {}
         self.mobTrackerCards[index] = card
     end
 
     local card = self.mobTrackerCards[index]
     card:SetWidth(self.mobTrackerFrame:GetWidth() - 22)
     return card
+end
+
+function LootMonitor:AcquireCardIconSlot(card, index)
+    if not card.iconSlots[index] then
+        local slot = CreateFrame("Frame", nil, card.iconContainer)
+        slot:SetWidth(16)
+        slot:SetHeight(16)
+
+        local icon = slot:CreateTexture(nil, "ARTWORK")
+        icon:SetAllPoints(slot)
+        icon:SetTexture(TEXTURE_PATH_QUESTION)
+
+        local countText = slot:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
+        countText:SetPoint("BOTTOMRIGHT", slot, "BOTTOMRIGHT", 3, -2)
+        countText:SetTextColor(1, 0.82, 0)
+
+        slot.icon = icon
+        slot.countText = countText
+        card.iconSlots[index] = slot
+    end
+    return card.iconSlots[index]
+end
+
+function LootMonitor:RenderMobCardIcons(card, sortedItems)
+    local iconSize = 16
+    local spacing = 3
+    local usableWidth = card:GetWidth()
+    local iconsPerRow = mathfloor((usableWidth + spacing) / (iconSize + spacing))
+    if iconsPerRow < 1 then iconsPerRow = 1 end
+
+    local itemCount = tgetn(sortedItems)
+    for i = 1, itemCount do
+        local item = sortedItems[i]
+        local slot = self:AcquireCardIconSlot(card, i)
+        local col = mathmod(i - 1, iconsPerRow)
+        local row = mathfloor((i - 1) / iconsPerRow)
+        local x = col * (iconSize + spacing)
+        local y = -row * (iconSize + spacing)
+
+        slot:ClearAllPoints()
+        slot:SetPoint("TOPLEFT", card.iconContainer, "TOPLEFT", x, y)
+        slot.icon:SetTexture(item.texture or TEXTURE_PATH_QUESTION)
+        slot.countText:SetText(item.qty)
+        slot:Show()
+    end
+
+    local j = itemCount + 1
+    while card.iconSlots[j] do
+        card.iconSlots[j]:Hide()
+        j = j + 1
+    end
+
+    local rows = mathfloor((itemCount - 1) / iconsPerRow) + 1
+    if itemCount == 0 then rows = 1 end
+    local iconAreaHeight = rows * iconSize + (rows - 1) * spacing
+    card.iconContainer:SetHeight(iconAreaHeight)
+    return iconAreaHeight
 end
 
 function LootMonitor:HideUnusedMobCards(startIndex)
@@ -851,26 +905,26 @@ function LootMonitor:RefreshMobTrackerWindow()
         end
 
         local mob = sortedMobs[i]
-        local sortedItems = self:GetSortedItemEntries(mob.data.items)
-        local totalValueCopper = self:GetMobTotalValueCopper(mob.data)
-        local headerText = strformat("%s x%d      ----      %dc", mob.name, mob.data.kills, totalValueCopper)
-        local lootText = self:BuildMobLootIconString(sortedItems)
+        if self:MobEntryHasLoot(mob.data) then
+            local sortedItems = self:GetSortedItemEntries(mob.data.items)
+            local totalValueCopper = self:GetMobTotalValueCopper(mob.data)
+            local headerText = strformat("%s x%d      ----      %dc", mob.name, mob.data.kills, totalValueCopper)
 
-        local card = self:AcquireMobCard(cardIndex)
-        card:ClearAllPoints()
-        card:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 12, yOffset)
-        card.topLine:SetText(headerText)
-        card.lootLine:SetText(lootText)
+            local card = self:AcquireMobCard(cardIndex)
+            card:ClearAllPoints()
+            card:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 12, yOffset)
+            card.topLine:SetText(headerText)
+            local iconHeight = self:RenderMobCardIcons(card, sortedItems)
 
-        local topHeight = card.topLine:GetStringHeight()
-        local lootHeight = card.lootLine:GetStringHeight()
-        local cardHeight = topHeight + lootHeight + 8
-        if cardHeight < 32 then cardHeight = 32 end
-        card:SetHeight(cardHeight)
-        card:Show()
+            local topHeight = card.topLine:GetHeight() or 12
+            local cardHeight = topHeight + iconHeight + 8
+            if cardHeight < 32 then cardHeight = 32 end
+            card:SetHeight(cardHeight)
+            card:Show()
 
-        yOffset = yOffset - cardHeight - 8
-        cardIndex = cardIndex + 1
+            yOffset = yOffset - cardHeight - 8
+            cardIndex = cardIndex + 1
+        end
     end
 
     self:HideUnusedMobCards(cardIndex)
