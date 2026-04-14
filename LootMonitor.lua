@@ -7,7 +7,6 @@ local strlower = string.lower
 local strsub = string.sub
 local strformat = string.format
 local strgsub = string.gsub
-local strmatch = string.match
 local strlen = string.len
 local tinsert = table.insert
 local tremove = table.remove
@@ -113,13 +112,16 @@ function LootMonitor:GetCoinValueCopper(itemName)
     if not itemName then return 0 end
 
     local lowerName = strlower(itemName)
-    local copper = tonumber(strmatch(lowerName, "^(%d+)%s*copper$"))
+    local _, _, copperStr = strfind(lowerName, "^(%d+)%s*copper$")
+    local copper = tonumber(copperStr)
     if copper and copper > 0 then return copper end
 
-    local silver = tonumber(strmatch(lowerName, "^(%d+)%s*silver$"))
+    local _, _, silverStr = strfind(lowerName, "^(%d+)%s*silver$")
+    local silver = tonumber(silverStr)
     if silver and silver > 0 then return silver * 100 end
 
-    local gold = tonumber(strmatch(lowerName, "^(%d+)%s*gold$"))
+    local _, _, goldStr = strfind(lowerName, "^(%d+)%s*gold$")
+    local gold = tonumber(goldStr)
     if gold and gold > 0 then return gold * 10000 end
 
     return 0
