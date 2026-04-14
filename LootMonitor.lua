@@ -11,6 +11,7 @@ local strlen = string.len
 local tinsert = table.insert
 local tremove = table.remove
 local tgetn = table.getn
+local tsort = table.sort
 local mathsin = math.sin
 local mathpi = math.pi
 local mathmod = mod  -- Lua 5.0 uses global mod, not math.mod
@@ -68,6 +69,15 @@ LootMonitor.maxNotifications = 5
 LootMonitor.frame = nil
 LootMonitor.moveFrame = nil
 LootMonitor.moveMode = false
+LootMonitor.mobTrackerFrame = nil
+LootMonitor.mobTrackerLines = {}
+LootMonitor.mobLootData = {}
+LootMonitor.pendingMobKills = {}
+LootMonitor.currentLootMob = nil
+LootMonitor.currentLootTime = 0
+
+local LOOT_SESSION_TIMEOUT = 2.5
+local MOB_KILL_TIMEOUT = 30
 
 
 
@@ -216,10 +226,22 @@ local defaults = {
     fadeOutTime = 1.0,
     questItemGlow = true,
     showTotalCount = true,
+    mobTrackerEnabled = true,
+    mobTrackerMaxMobs = 6,
+    mobTrackerRetention = 900,
     position = {
         point = "CENTER",
         x = 200,
         y = 100
+    },
+    mobTrackerPosition = {
+        point = "CENTER",
+        x = -260,
+        y = 100
+    },
+    mobTrackerSize = {
+        width = 280,
+        height = 260
     }
 }
 
@@ -247,10 +269,18 @@ function LootMonitor:OnLoad()
             if not LootMonitorDB[key].point then LootMonitorDB[key].point = value.point end
             if LootMonitorDB[key].x == nil then LootMonitorDB[key].x = value.x end
             if LootMonitorDB[key].y == nil then LootMonitorDB[key].y = value.y end
+        elseif key == "mobTrackerPosition" and LootMonitorDB[key] then
+            if not LootMonitorDB[key].point then LootMonitorDB[key].point = value.point end
+            if LootMonitorDB[key].x == nil then LootMonitorDB[key].x = value.x end
+            if LootMonitorDB[key].y == nil then LootMonitorDB[key].y = value.y end
+        elseif key == "mobTrackerSize" and LootMonitorDB[key] then
+            if LootMonitorDB[key].width == nil then LootMonitorDB[key].width = value.width end
+            if LootMonitorDB[key].height == nil then LootMonitorDB[key].height = value.height end
         end
     end
     
     self:CreateNotificationFrame()
+    self:CreateMobTrackerFrame()
     
     Print("[Loot Monitor] Loaded! Fading loot notifications enabled.")
 end
@@ -268,6 +298,26 @@ function LootMonitor:SavePosition()
             LootMonitorDB.position.y = y
         end
     end
+end
+
+function LootMonitor:SaveMobTrackerWindow()
+    if not self.mobTrackerFrame then return end
+
+    local point, _, _, x, y = self.mobTrackerFrame:GetPoint()
+    if point and x and y then
+        if not LootMonitorDB.mobTrackerPosition then
+            LootMonitorDB.mobTrackerPosition = {}
+        end
+        LootMonitorDB.mobTrackerPosition.point = point
+        LootMonitorDB.mobTrackerPosition.x = x
+        LootMonitorDB.mobTrackerPosition.y = y
+    end
+
+    if not LootMonitorDB.mobTrackerSize then
+        LootMonitorDB.mobTrackerSize = {}
+    end
+    LootMonitorDB.mobTrackerSize.width = self.mobTrackerFrame:GetWidth()
+    LootMonitorDB.mobTrackerSize.height = self.mobTrackerFrame:GetHeight()
 end
 
 -- Create the notification container frame
@@ -298,12 +348,88 @@ function LootMonitor:CreateNotificationFrame()
     frame:Show()
 end
 
+function LootMonitor:CreateMobTrackerFrame()
+    local frame = CreateFrame("Frame", "LootMonitorMobTrackerFrame", UIParent)
+    frame:SetBackdrop({
+        bgFile = BACKDROP_TOOLTIP_BG,
+        edgeFile = BACKDROP_TOOLTIP_BORDER,
+        tile = true,
+        tileSize = 16,
+        edgeSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 }
+    })
+    frame:SetBackdropColor(0.05, 0.05, 0.05, 0.92)
+    frame:SetBackdropBorderColor(0.4, 0.4, 0.4, 1)
+
+    local width = LootMonitorDB.mobTrackerSize.width or 280
+    local height = LootMonitorDB.mobTrackerSize.height or 260
+    frame:SetWidth(width)
+    frame:SetHeight(height)
+
+    local point = LootMonitorDB.mobTrackerPosition.point or "CENTER"
+    local x = LootMonitorDB.mobTrackerPosition.x
+    local y = LootMonitorDB.mobTrackerPosition.y
+    if x == nil then x = -260 end
+    if y == nil then y = 100 end
+    frame:SetPoint(point, UIParent, point, x, y)
+
+    frame:SetMovable(true)
+    frame:EnableMouse(true)
+    frame:RegisterForDrag("LeftButton")
+    frame:SetScript("OnDragStart", function()
+        frame:StartMoving()
+    end)
+    frame:SetScript("OnDragStop", function()
+        frame:StopMovingOrSizing()
+        LootMonitor:SaveMobTrackerWindow()
+    end)
+    frame:SetMinResize(220, 140)
+    frame:SetMaxResize(600, 700)
+    frame:SetResizable(true)
+    frame:SetScript("OnSizeChanged", function()
+        LootMonitor:SaveMobTrackerWindow()
+        LootMonitor:RefreshMobTrackerWindow()
+    end)
+
+    local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOPLEFT", frame, "TOPLEFT", 10, -10)
+    title:SetText("Recent Mob Loot")
+    title:SetTextColor(1, 0.85, 0.3)
+
+    local resizeHandle = CreateFrame("Button", nil, frame)
+    resizeHandle:SetWidth(16)
+    resizeHandle:SetHeight(16)
+    resizeHandle:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -3, 3)
+    resizeHandle:EnableMouse(true)
+    resizeHandle:SetScript("OnMouseDown", function()
+        frame:StartSizing("BOTTOMRIGHT")
+    end)
+    resizeHandle:SetScript("OnMouseUp", function()
+        frame:StopMovingOrSizing()
+        LootMonitor:SaveMobTrackerWindow()
+    end)
+    local resizeTex = resizeHandle:CreateTexture(nil, "OVERLAY")
+    resizeTex:SetAllPoints(resizeHandle)
+    resizeTex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+
+    self.mobTrackerFrame = frame
+
+    if LootMonitorDB.mobTrackerEnabled then
+        frame:Show()
+    else
+        frame:Hide()
+    end
+
+    self:RefreshMobTrackerWindow()
+end
+
 -- Register events to track loot
 function LootMonitor:RegisterEvents()
     local frame = CreateFrame("Frame")
     frame:RegisterEvent("CHAT_MSG_LOOT")
     frame:RegisterEvent("CHAT_MSG_MONEY")
     frame:RegisterEvent("CHAT_MSG_SYSTEM")
+    frame:RegisterEvent("CHAT_MSG_COMBAT_HOSTILE_DEATH")
     frame:RegisterEvent("ADDON_LOADED")
     frame:RegisterEvent("PLAYER_LOGOUT")
     frame:SetScript("OnEvent", function()
@@ -318,11 +444,204 @@ function LootMonitor:RegisterEvents()
             LootMonitor:ProcessMoneyMessage(arg1)
         elseif event == "CHAT_MSG_SYSTEM" then
             LootMonitor:ProcessSystemMessage(arg1)
+        elseif event == "CHAT_MSG_COMBAT_HOSTILE_DEATH" then
+            LootMonitor:ProcessMobDeathMessage(arg1)
         elseif event == "PLAYER_LOGOUT" then
             -- Save position before logout
             LootMonitor:SavePosition()
+            LootMonitor:SaveMobTrackerWindow()
         end
     end)
+end
+
+function LootMonitor:ProcessMobDeathMessage(message)
+    if not message or not LootMonitorDB.mobTrackerEnabled then return end
+
+    local mobName = strgsub(message, " dies%.$", "")
+    if not mobName or mobName == "" or mobName == message then
+        return
+    end
+
+    tinsert(self.pendingMobKills, { name = mobName, time = gettime() })
+end
+
+function LootMonitor:CleanupPendingMobKills()
+    local now = gettime()
+    local i = 1
+    while i <= tgetn(self.pendingMobKills) do
+        local entry = self.pendingMobKills[i]
+        if not entry or (now - entry.time) > MOB_KILL_TIMEOUT then
+            tremove(self.pendingMobKills, i)
+        else
+            i = i + 1
+        end
+    end
+end
+
+function LootMonitor:ResolveLootMob()
+    local now = gettime()
+
+    if self.currentLootMob and (now - self.currentLootTime) <= LOOT_SESSION_TIMEOUT then
+        self.currentLootTime = now
+        return self.currentLootMob, false
+    end
+
+    self.currentLootMob = nil
+    self:CleanupPendingMobKills()
+
+    if tgetn(self.pendingMobKills) == 0 then
+        return nil, false
+    end
+
+    local pending = self.pendingMobKills[1]
+    tremove(self.pendingMobKills, 1)
+    self.currentLootMob = pending.name
+    self.currentLootTime = now
+    return pending.name, true
+end
+
+function LootMonitor:PruneOldMobEntries()
+    local retention = LootMonitorDB.mobTrackerRetention or 900
+    local now = gettime()
+    for mobName, mobEntry in pairs(self.mobLootData) do
+        if mobEntry and (now - mobEntry.lastUpdate) > retention then
+            self.mobLootData[mobName] = nil
+        end
+    end
+end
+
+function LootMonitor:RegisterMobLoot(itemName, quantity)
+    if not LootMonitorDB.mobTrackerEnabled then return end
+    if not itemName then return end
+
+    local mobName, isNewKill = self:ResolveLootMob()
+    if not mobName then return end
+
+    local entry = self.mobLootData[mobName]
+    if not entry then
+        entry = {
+            kills = 0,
+            items = {},
+            lastUpdate = gettime()
+        }
+        self.mobLootData[mobName] = entry
+    end
+
+    if isNewKill then
+        entry.kills = entry.kills + 1
+    end
+
+    local itemQty = quantity or 1
+    if itemQty < 1 then itemQty = 1 end
+    if not entry.items[itemName] then
+        entry.items[itemName] = 0
+    end
+    entry.items[itemName] = entry.items[itemName] + itemQty
+    entry.lastUpdate = gettime()
+
+    self:PruneOldMobEntries()
+    self:RefreshMobTrackerWindow()
+end
+
+function LootMonitor:GetSortedMobEntries()
+    local list = {}
+    for mobName, data in pairs(self.mobLootData) do
+        if data then
+            tinsert(list, { name = mobName, data = data })
+        end
+    end
+
+    tsort(list, function(a, b)
+        return a.data.lastUpdate > b.data.lastUpdate
+    end)
+
+    return list
+end
+
+function LootMonitor:GetSortedItemEntries(itemTable)
+    local itemList = {}
+    for itemName, qty in pairs(itemTable) do
+        tinsert(itemList, { name = itemName, qty = qty })
+    end
+
+    tsort(itemList, function(a, b)
+        if a.qty == b.qty then
+            return a.name < b.name
+        end
+        return a.qty > b.qty
+    end)
+
+    return itemList
+end
+
+function LootMonitor:AcquireMobLine(index)
+    if not self.mobTrackerLines[index] then
+        local line = self.mobTrackerFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        line:SetJustifyH("LEFT")
+        line:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 12, -28)
+        self.mobTrackerLines[index] = line
+    end
+    return self.mobTrackerLines[index]
+end
+
+function LootMonitor:RefreshMobTrackerWindow()
+    if not self.mobTrackerFrame then return end
+    if not LootMonitorDB.mobTrackerEnabled then
+        self.mobTrackerFrame:Hide()
+        return
+    end
+    self.mobTrackerFrame:Show()
+
+    self:PruneOldMobEntries()
+
+    local maxEntries = LootMonitorDB.mobTrackerMaxMobs or 6
+    local sortedMobs = self:GetSortedMobEntries()
+    local lineIndex = 1
+    local yOffset = -30
+    local maxHeight = self.mobTrackerFrame:GetHeight() - 16
+
+    local mobCount = tgetn(sortedMobs)
+    for i = 1, mobCount do
+        if i > maxEntries or -yOffset > maxHeight then
+            break
+        end
+
+        local mob = sortedMobs[i]
+        local header = self:AcquireMobLine(lineIndex)
+        header:ClearAllPoints()
+        header:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 12, yOffset)
+        header:SetText(mob.name .. " - " .. mob.data.kills .. " kill(s)")
+        header:SetTextColor(1, 0.85, 0.3)
+        header:Show()
+        lineIndex = lineIndex + 1
+        yOffset = yOffset - 16
+
+        local sortedItems = self:GetSortedItemEntries(mob.data.items)
+        local itemCount = tgetn(sortedItems)
+        for j = 1, itemCount do
+            if -yOffset > maxHeight then
+                break
+            end
+
+            local item = sortedItems[j]
+            local itemLine = self:AcquireMobLine(lineIndex)
+            itemLine:ClearAllPoints()
+            itemLine:SetPoint("TOPLEFT", self.mobTrackerFrame, "TOPLEFT", 24, yOffset)
+            itemLine:SetText(item.name .. " " .. item.qty .. "x")
+            itemLine:SetTextColor(0.92, 0.92, 0.92)
+            itemLine:Show()
+            lineIndex = lineIndex + 1
+            yOffset = yOffset - 14
+        end
+
+        yOffset = yOffset - 4
+    end
+
+    local i = lineIndex
+    while self.mobTrackerLines[i] do
+        self.mobTrackerLines[i]:Hide()
+        i = i + 1
+    end
 end
 
 -- Extract quantity from loot message (looks for x2, x3, etc.)
@@ -576,6 +895,8 @@ function LootMonitor:AddLootItem(itemData, isNameOnly, quantity)
         -- Create new notification
         self:CreateLootNotification(itemName, actualQuantity, itemData, isNameOnly)
     end
+
+    self:RegisterMobLoot(itemName, actualQuantity)
 end
 
 -- Find item texture and bag position in player's bags (optimized)
