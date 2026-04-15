@@ -140,6 +140,19 @@ function LootMonitor:GetItemLinkForValue(itemName, itemData, isNameOnly)
     return nil
 end
 
+function LootMonitor:NormalizeItemHyperlink(link)
+    if not link then return nil end
+
+    -- If we received a full colored link, convert it to an itemstring.
+    -- Classic tooltips can error on some full-link formats ("Unknown line type").
+    local _, _, itemString = strfind(link, "(item:%d+:%d+:%d+:%d+)")
+    if itemString then
+        return itemString
+    end
+
+    return link
+end
+
 function LootMonitor:GetItemValueCopper(itemName, itemData, isNameOnly)
     local coinValue = self:GetCoinValueCopper(itemName)
     if coinValue > 0 then
@@ -150,13 +163,14 @@ function LootMonitor:GetItemValueCopper(itemName, itemData, isNameOnly)
     if not link then
         return 0
     end
+    link = self:NormalizeItemHyperlink(link)
 
     -- Prefer Aux tooltip money if Aux addon tooltip exists.
     if AuxTooltip then
         AuxTooltip:SetOwner(UIParent, "ANCHOR_NONE")
         AuxTooltip.money = 0
-        AuxTooltip:SetHyperlink(link)
-        if AuxTooltip.money and AuxTooltip.money > 0 then
+        local ok = pcall(function() AuxTooltip:SetHyperlink(link) end)
+        if ok and AuxTooltip.money and AuxTooltip.money > 0 then
             return AuxTooltip.money
         end
     end
@@ -164,7 +178,7 @@ function LootMonitor:GetItemValueCopper(itemName, itemData, isNameOnly)
     -- Fallback to internal tooltip money scan.
     LootMonitorValueTooltip:SetOwner(UIParent, "ANCHOR_NONE")
     LootMonitorValueTooltip.money = 0
-    LootMonitorValueTooltip:SetHyperlink(link)
+    pcall(function() LootMonitorValueTooltip:SetHyperlink(link) end)
     if LootMonitorValueTooltip.money and LootMonitorValueTooltip.money > 0 then
         return LootMonitorValueTooltip.money
     end
