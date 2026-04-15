@@ -791,6 +791,23 @@ function LootMonitor:GetMobTotalValueCopper(mobEntry)
     return total
 end
 
+function LootMonitor:TryUpdateMobItemValues(mobEntry)
+    if not mobEntry then return false end
+    local changed = false
+
+    for itemName, itemData in pairs(mobEntry.items) do
+        if (itemData.unitValue or 0) == 0 and (itemData.count or 0) > 0 then
+            local updatedValue = self:GetItemValueCopper(itemName, nil, true)
+            if updatedValue and updatedValue > 0 then
+                itemData.unitValue = updatedValue
+                changed = true
+            end
+        end
+    end
+
+    return changed
+end
+
 function LootMonitor:AcquireMobCard(index)
     if not self.mobTrackerCards[index] then
         local card = CreateFrame("Frame", nil, self.mobTrackerFrame)
@@ -897,17 +914,19 @@ function LootMonitor:RefreshMobTrackerWindow()
     local maxEntries = LootMonitorDB.mobTrackerMaxMobs or 6
     local sortedMobs = self:GetSortedMobEntries()
     local cardIndex = 1
+    local displayedMobs = 0
     local yOffset = -30
     local maxHeight = self.mobTrackerFrame:GetHeight() - 16
 
     local mobCount = tgetn(sortedMobs)
     for i = 1, mobCount do
-        if i > maxEntries or -yOffset > maxHeight then
+        if displayedMobs >= maxEntries or -yOffset > maxHeight then
             break
         end
 
         local mob = sortedMobs[i]
         if self:MobEntryHasLoot(mob.data) then
+            self:TryUpdateMobItemValues(mob.data)
             local sortedItems = self:GetSortedItemEntries(mob.data.items)
             local totalValueCopper = self:GetMobTotalValueCopper(mob.data)
             local headerText = strformat("%s x%d      ----      %dc", mob.name, mob.data.kills, totalValueCopper)
@@ -926,6 +945,7 @@ function LootMonitor:RefreshMobTrackerWindow()
 
             yOffset = yOffset - cardHeight - 8
             cardIndex = cardIndex + 1
+            displayedMobs = displayedMobs + 1
         end
     end
 
