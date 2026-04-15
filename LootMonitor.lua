@@ -127,17 +127,53 @@ function LootMonitor:GetCoinValueCopper(itemName)
     return 0
 end
 
+function LootMonitor:FormatCopperVerbose(copper)
+    local amount = tonumber(copper) or 0
+    if amount < 0 then amount = 0 end
+
+    local gold = mathfloor(amount / 10000)
+    local silver = mathfloor(mathmod(amount, 10000) / 100)
+    local cop = mathmod(amount, 100)
+
+    local parts = {}
+    if gold > 0 then
+        tinsert(parts, gold .. "g")
+    end
+    if silver > 0 or gold > 0 then
+        tinsert(parts, silver .. "s")
+    end
+    tinsert(parts, cop .. "c")
+    return table.concat(parts, " ")
+end
+
+function LootMonitor:FormatCopperCompact(copper)
+    local amount = tonumber(copper) or 0
+    if amount < 0 then amount = 0 end
+
+    local gold = mathfloor(amount / 10000)
+    local silver = mathfloor(mathmod(amount, 10000) / 100)
+    local cop = mathmod(amount, 100)
+
+    if gold > 0 then
+        return strformat("%dg%ds", gold, silver)
+    elseif silver > 0 then
+        return strformat("%ds%dc", silver, cop)
+    else
+        return strformat("%dc", cop)
+    end
+end
+
 function LootMonitor:GetItemLinkForValue(itemName, itemData, isNameOnly)
     if not isNameOnly and itemData and strfind(itemData, "|Hitem:") then
-        return itemData
+        return itemData, nil, nil
     end
 
     local _, bag, slot = self:FindItemInBags(itemName)
     if bag and slot then
-        return GetContainerItemLink(bag, slot)
+        return GetContainerItemLink(bag, slot), bag, slot
     end
 
-    return nil
+    return nil, nil, nil
 end
 
 function LootMonitor:NormalizeItemHyperlink(link)
@@ -159,25 +195,42 @@ function LootMonitor:GetItemValueCopper(itemName, itemData, isNameOnly)
         return coinValue
     end
 
-    local link = self:GetItemLinkForValue(itemName, itemData, isNameOnly)
+    local link, bag, slot = self:GetItemLinkForValue(itemName, itemData, isNameOnly)
     if not link then
         return 0
     end
     link = self:NormalizeItemHyperlink(link)
 
-    -- Prefer Aux tooltip money if Aux addon tooltip exists.
+    -- Prefer Aux tooltip money using the same flow as Aux util/info.lua:
+    -- SetBagItem first when bag/slot exists, then fallback to hyperlink.
     if AuxTooltip then
         AuxTooltip:SetOwner(UIParent, "ANCHOR_NONE")
         AuxTooltip.money = 0
-        local ok = pcall(function() AuxTooltip:SetHyperlink(link) end)
-        if ok and AuxTooltip.money and AuxTooltip.money > 0 then
+
+        if bag and slot then
+            local okBag = pcall(function() AuxTooltip:SetBagItem(bag, slot) end)
+            if okBag and AuxTooltip.money and AuxTooltip.money > 0 then
+                return AuxTooltip.money
+            end
+        end
+
+        local okLink = pcall(function() AuxTooltip:SetHyperlink(link) end)
+        if okLink and AuxTooltip.money and AuxTooltip.money > 0 then
             return AuxTooltip.money
         end
     end
 
-    -- Fallback to internal tooltip money scan.
+    -- Fallback to internal tooltip money scan using same order.
     LootMonitorValueTooltip:SetOwner(UIParent, "ANCHOR_NONE")
     LootMonitorValueTooltip.money = 0
+
+    if bag and slot then
+        pcall(function() LootMonitorValueTooltip:SetBagItem(bag, slot) end)
+        if LootMonitorValueTooltip.money and LootMonitorValueTooltip.money > 0 then
+            return LootMonitorValueTooltip.money
+        end
+    end
+
     pcall(function() LootMonitorValueTooltip:SetHyperlink(link) end)
     if LootMonitorValueTooltip.money and LootMonitorValueTooltip.money > 0 then
         return LootMonitorValueTooltip.money
@@ -721,6 +774,26 @@ function LootMonitor:RegisterMobLoot(itemName, quantity, itemData, isNameOnly)
         self.mobLootData[mobName] = entry
     end
 
+    -- Normalize all currency drops into one combined "Coins" entry.
+    local coinValue = self:GetCoinValueCopper(itemName)
+    if coinValue > 0 then
+        local moneyKey = "Coins"
+        if not entry.items[moneyKey] then
+            entry.items[moneyKey] = {
+                count = 0,
+                texture = COIN_ICON_GOLD,
+                unitValue = 1
+            }
+        end
+        entry.items[moneyKey].count = entry.items[moneyKey].count + coinValue
+        entry.items[moneyKey].texture = COIN_ICON_GOLD
+        entry.items[moneyKey].unitValue = 1
+        entry.lastUpdate = gettime()
+        self:PruneOldMobEntries()
+        self:RefreshMobTrackerWindow()
+        return
+    end
+
     local itemQty = quantity or 1
     if itemQty < 1 then itemQty = 1 end
     if not entry.items[itemName] then
@@ -890,7 +963,11 @@ function LootMonitor:RenderMobCardIcons(card, sortedItems)
         slot:ClearAllPoints()
         slot:SetPoint("TOPLEFT", card.iconContainer, "TOPLEFT", x, y)
         slot.icon:SetTexture(item.texture or TEXTURE_PATH_QUESTION)
-        slot.countText:SetText(item.qty)
+        if item.name == "Coins" then
+            slot.countText:SetText(self:FormatCopperCompact(item.qty))
+        else
+            slot.countText:SetText(item.qty)
+        end
         slot:Show()
     end
 
@@ -943,7 +1020,7 @@ function LootMonitor:RefreshMobTrackerWindow()
             self:TryUpdateMobItemValues(mob.data)
             local sortedItems = self:GetSortedItemEntries(mob.data.items)
             local totalValueCopper = self:GetMobTotalValueCopper(mob.data)
-            local headerText = strformat("%s x%d      ----      %dc", mob.name, mob.data.kills, totalValueCopper)
+            local headerText = strformat("%s x%d      ----      %s", mob.name, mob.data.kills, self:FormatCopperVerbose(totalValueCopper))
 
             local card = self:AcquireMobCard(cardIndex)
             card:ClearAllPoints()
